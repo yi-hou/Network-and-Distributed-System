@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+import sys
+import socket
+# import html
+from html.parser import HTMLParser
+import xml
+import json, re
+import queue
+
+user_name = None
+user_password = None
+HOST = 'Host: fring.ccs.neu.edu\r\n'
+CONNECTION = 'Connection: keep-alive\r\n'
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+user_cookie = None
+user_csrftoken = None
+user_sessionid = None
+private_location = None
+urls = queue.Queue(maxsize=50000)
+secret_flags = set()
+visited_urls = set()
+DATA_SIZE = 4096
+
+class MyHTMLParser(HTMLParser):
+    global urls, secret_flags, visited_urls, secret_flags
+    def __init__(self):
+        HTMLParser.__init__(self)
+        self.data = None
+        self.found = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag == 'a':
+            if attrs[0][0] == 'href':
+                new_url = attrs[0][1]
+                if (new_url != '/fakebook/' and new_url[:10] == '/fakebook/') and (new_url not in visited_urls):
+                    urls.put(attrs[0][1])
+        elif tag == 'h2' :
+            if attrs:
+                if attrs[0][0] == 'class':
+                    if attrs[0][1] == 'secret_flag':
+                        self.found = True
+
+    def handle_data(self, data):
+        if self.found:
+            flag = data.split(':')[1]
+            secret_flags.add(flag)
+            print("====this is secrete flag!!!!!======", flag)
+            self.found = False
+
+
+def login():
+    global user_csrftoken, user_sessionid, DATA_SIZE
+    post = "POST /accounts/login/?next=/fakebook/ HTTP/1.1\r\n"
+    parameters = "username=" + user_name + "&password=" + user_password + "&csrfmiddlewaretoken=" + user_csrftoken \
+                 + "&next=/fakebook\r\n"
+    contentLength = "Content-Length: " + str(len(parameters)) + "\r\n"
+    contentType = "Content-Type: application/x-www-form-urlencoded\r\n"
+    cookie = "Cookie: csrftoken=" + user_csrftoken + "; sessionid=" + user_sessionid + "\r\n"
+    http_header = post + HOST + contentType + contentLength + cookie + CONNECTION + "\r\n"
+    finalMessage = http_header + parameters
+    s.sendall(finalMessage.encode())
+    returned_mess = b''
+    while True:
+        part = s.recv(DATA_SIZE)
+        returned_mess += part
+        if len(part) < DATA_SIZE:
+            break
+
+    fetch_info_from_header(returned_mess.decode())
+    return True
+
+def parse_header(header):
+    header_dic = {}
+    for h in header:
+        index = h.find(":")
+        header_dic[h[:index]] = h[index + 1:]
+    return header_dic
+
+
+def get_urls(url):
+    global urls, user_sessionid, user_csrftoken, CONNECTION, DATA_SIZE,s
+    s.close()
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect(("fring.ccs.neu.edu", 80))
+    get = "GET " + url + " HTTP/1.1\r\n"
+    cookie = "Cookie: csrftoken=" + user_csrftoken + "; sessionid=" + user_sessionid + "\r\n"
+    finalMessage = get + HOST + CONNECTION + cookie + "\r\n"
+    s.sendall(finalMessage.encode('utf-8'))
+    res = b''
+    #while True:
+    part = s.recv(DATA_SIZE)
+    res += part
+    #    if len(part) < DATA_SIZE:
+    #       break
+    res = res.decode('utf-8')
+
+    all_contents = None
+    if res:
+        # divide header and html into 2 parts
+        res = res.split("\r\n\r\n")
+        header = res[0]
+        html = res[1:]
+        # parse header
+        header_lines = header.splitlines()
+        response_code = header_lines[0]
+        parsed_header = parse_header(header_lines[1:])
+        #print("response code", response_code)
+        if '200' in response_code:
+            if 'Content-Length' in parsed_header.keys():
+                #c_length = int(parsed_header['Content-Length'])
+                all_contents = html[0]
+            elif 'Transfer-Encoding' in parsed_header.keys():
+                # if received chunked data, continue receiving and parse them
+                if 'chunked' in parsed_header['Transfer-Encoding']:
+                    all_contents = parse_chunk(html)
+                    while True:
+                        more_content = s.recv(DATA_SIZE).decode()
+                        len_content = len(more_content)
+                        if len_content != 0:
+                            more_html = more_content.split('\r\n')
+                            all_contents += parse_chunk(more_html)
+                            if len_content < DATA_SIZE:
+                                break
+                        else:
+                            break
+
+        elif '500' in response_code:
+           visited_urls.remove(url)
+           urls.put(url)
+        elif '301' in response_code or '302' in response_code:
+            new_location = parsed_header['Location']
+            urls.put(new_location)
+
+        if all_contents:
+            p = MyHTMLParser()
+            p.feed(all_contents)
+
+    print('===len====of queue===', urls.qsize())
+
+def crawl():
+    global urls, visited_urls
+    while (not urls.empty()):
+        url = urls.get()
+        if url in visited_urls:
+            continue
+        else:
+            visited_urls.add(url)
+            get_urls(url)
+
+
+def parse_chunk(html):
+    contents = ""
+    for chunk in html:
+        try:
+            chunk_size = int(chunk, 16)
+            if chunk_size == 0:
+                break
+        except ValueError:
+            contents += chunk
+            continue
+    return contents
+
+
+def fetch_info_from_header(message):
+    global user_csrftoken, user_sessionid, private_location
+    message_line = message.splitlines()
+    for line in message_line:
+        if 'Set-Cookie' in line:
+            split = re.split('; |: |=|\n', line)
+            if 'csrftoken' == split[1]:
+                user_csrftoken = split[2]
+            elif 'sessionid' == split[1]:
+                user_sessionid = split[2]
+        if 'Location' in line:
+            split = line.split(': ')
+            private_location = split[-1]
+
+if __name__ == "__main__":
+    #print("*******************new start**********")
+    user_name = sys.argv[1]
+    user_password = sys.argv[2]
+
+    s.connect(("fring.ccs.neu.edu", 80))
+
+    # initial get
+    message = "GET /accounts/login/?next=/fakebook/ HTTP/1.1\r\n"
+    finalMessage = message + HOST + CONNECTION + "\r\n"
+    s.sendall(finalMessage.encode())
+    #print("**********The initial GET message**********")
+    #print(finalMessage)
+    returned_mess = b''
+    while True:
+        part = s.recv(DATA_SIZE)
+        returned_mess += part
+        if len(part) < DATA_SIZE:
+            break
+
+    # TODO
+    # need to check whether the returned_mess has 200 in the header
+    returned_mess = returned_mess.decode()
+    fetch_info_from_header(returned_mess)
+
+    login()
+
+    while len(secret_flags) < 5:
+        get_urls('/fakebook/')
+        crawl()
+

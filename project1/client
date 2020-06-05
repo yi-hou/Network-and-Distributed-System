@@ -1,0 +1,77 @@
+#!/usr/bin/env python
+import socket
+import sys
+import ssl
+import argparse
+
+# count how many times given char appears in given string
+def occurrence(s, c):
+  n = 0
+  for i in s:
+    if i == c:
+       n = n + 1
+  return n
+
+parser = argparse.ArgumentParser()
+# add arguments 
+parser.add_argument("-p", help="port", default="27993") # default port is 27993
+parser.add_argument("-s", "--flag", help="flag", action="store_true") # if there is -s flag, store it
+parser.add_argument("hostname", help="hostname")
+parser.add_argument("nuid", help="nuid")
+
+# parse arguments
+args = parser.parse_args()
+PORT = int(args.p)
+HOST = args.hostname
+NUID = args.nuid
+
+client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+# when require -s 
+if args.flag and PORT == 27993:
+   PORT = 27994
+   context = ssl.create_default_context()
+   context.check_hostname = False
+   context.verify_mode = ssl.CERT_NONE
+   client = context.wrap_socket(client, server_hostname = HOST)
+
+try: 
+  client.connect((HOST, PORT))
+except:
+  raise Exception("please enter valid host and port")
+    
+hello_message = "cs3700fall2019 HELLO " + NUID + '\n'
+# send HELLO message to server
+client.sendall(hello_message)
+
+# response receive from server
+server_response = client.recv(8192)
+# read server message until there is newline
+while server_response[-1:] != '\n':
+   server_response += client.recv(8192)
+# parse messeage receive from server, delimiter is space
+data = server_response.split()
+# check if response contains three fields and the first field is cs3700fall2019
+assert (len(data) == 4 or len(data) == 3) and data[0] == "cs3700fall2019", 'Something wrong with Received message'
+
+# keep reading server's FIND message until BYE message appears 
+while data[1] == 'FIND':
+   # count the number of times the given ASCII symbol appears in the random string 
+   count = occurrence(data[3], data[2])
+   # send count message to server
+   count_message = "cs3700fall2019 COUNT " + str(count) + '\n'
+   client.sendall(count_message)
+   server_response = client.recv(8192)
+   # read server message until there is newline
+   while server_response[-1:] != '\n':
+     server_response += client.recv(8192)
+   data = server_response.split()
+   # check if response contains three fields and the first field is cs3700fall2019
+   assert (len(data) == 4 or len(data) == 3) and data[0] == "cs3700fall2019", 'Something wrong with Received message'
+
+# when server reponse with bye message
+if data[1] == 'BYE':
+   print data[2]
+else:
+    raise Exception("There's error with Received message")
+   
+client.close()

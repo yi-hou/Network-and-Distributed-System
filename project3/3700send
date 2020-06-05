@@ -1,0 +1,142 @@
+#!/usr/bin/python -u
+
+
+import sys
+import socket
+import time
+import datetime
+import select
+import json
+import math
+
+MSG_SIZE = 1500
+DATA_SIZE = 1000
+TIMEOUT = 0.6
+SEQUENCE = 0
+ADV_WND = 10
+SENT_PACKETS = {}
+SSTHRESH = ADV_WND
+CWND = 10
+ACKs = {}
+WND = 0
+retransimit_counter = {}
+
+# Bind to localhost and an ephemeral port
+IP_PORT = sys.argv[1]
+UDP_IP = IP_PORT[0:IP_PORT.find(":")]
+UDP_PORT = int(IP_PORT[IP_PORT.find(":") + 1:])
+dest = (UDP_IP, UDP_PORT)
+
+# set up the socket
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(TIMEOUT)
+
+# log information
+def log(string):
+    sys.stderr.write(datetime.datetime.now().strftime("%H:%M:%S.%f") + " " + string + "\n")
+
+# send packets in window size
+def sliding_window():
+    global SEQUENCE, CWND, SENT_PACKETS, WND, SSTHRESH
+    # if there are packets in buffer, retransmit them first
+    WND = 0
+    if SENT_PACKETS:
+        if CWND > 2:
+            CWND = SSTHRESH / 2
+        else:
+            CWND = 1
+        fast_retransmission()
+        # counter of packet
+    while WND < CWND:
+        data = sys.stdin.read(DATA_SIZE)
+        if (len(data) > 0):
+            msg_content = {"sequence": SEQUENCE, "data": data, "ack": False, "eof": False}
+            msg = json.dumps(msg_content)
+            SENT_PACKETS[SEQUENCE] = msg_content
+            retransimit_counter[SEQUENCE] = 0
+            assert (len(msg) <= 1472), "ERROR: Datagram is longer than 1472 bytes!!!"
+
+            if sock.sendto(msg, dest) < len(msg):
+                log("[error] unable to fully send packet")
+            else:
+                log("[send data] " + str(SEQUENCE) + " (" + str(len(data)) + ")")
+            SEQUENCE += len(data)
+            WND += 1
+        else:
+            return False
+    return True
+
+
+# takes index of the first packet that needs retransmitting
+def fast_retransmission():
+    global CWND, SENT_PACKETS, WND, retransimit_counter
+    # check if retransmit three times, send packets twice
+    for sequence, counter in retransimit_counter.items():
+        if counter >= 3 and WND < CWND:
+            if counter >= 7:
+                TIMEOUT = TIMEOUT + 0.3
+            msg = json.dumps(SENT_PACKETS[sequence])
+            if sock.sendto(msg, dest) < len(msg):
+                log("[error] unable to fully send packet")
+            else:
+                log("[send data] " + str(sequence) + " (" + str(len(SENT_PACKETS[sequence]['data'])) + ")")
+            WND += 1
+
+    sp = SENT_PACKETS.values()
+    i = 0
+    while WND < CWND and i < len(sp):
+        msg = json.dumps(sp[i])
+        retransimit_counter[sp[i]["sequence"]] += 1
+        if sock.sendto(msg, dest) < len(msg):
+            log("[error] unable to fully send packet")
+        else:
+            log("[send data] " + str(sp[i]["sequence"]) + " (" + str(len(sp[i]["data"])) + ")")
+        i += 1
+        WND += 1
+
+
+# send first sliding window
+sliding_window()
+
+# Now read in data, send packets
+while True:
+    log("ABOUT TO SLEEP")
+    # receive number of acks same as number of packets sent to receiver
+    counter = 0
+    numPackets = len(SENT_PACKETS.keys())
+    while counter < numPackets:
+        try:
+            result = sock.recvfrom(MSG_SIZE)
+            counter += 1
+            if result:
+                (data, addr) = result
+                if CWND < SSTHRESH:
+                   # increase window size by one when bandwidth allows
+                   CWND += 1
+                try:
+                    decoded = json.loads(data)
+                    # If there is an ack for this sent_packet, remove buffer from sent_packets, send next window
+                    log("[recv ack] " + str(decoded["ack"]))
+                     # remove sent packet from buffer if acked by receiver
+                    if decoded['sequence'] in SENT_PACKETS:
+                        del SENT_PACKETS[decoded["sequence"]]
+                        del retransimit_counter[decoded["sequence"]]
+                    else:
+                        TIMEOUT = TIMEOUT + 0.5
+                        CWND = CWND / 2
+                except (ValueError, KeyError, TypeError):
+                    log("[recv corrupt packet]")
+            else:
+                # Timeout: multiplacative decrease
+                SSTHRESH = CWND / 2
+                CWND = 1
+                log("[error] timeout")
+        except socket.timeout:
+            break
+    # continue sending data until there's no more data need to be sent
+    if (not sliding_window()):
+        if not SENT_PACKETS:
+            break
+
+sock.sendto(json.dumps({"eof": True, "data": "", "sequence": SEQUENCE, "ack": False}), dest)
+sys.exit(0)

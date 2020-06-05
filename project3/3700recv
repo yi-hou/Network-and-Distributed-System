@@ -1,0 +1,102 @@
+#!/usr/bin/python -u
+
+import sys
+import socket
+import time
+import datetime
+import select
+import json
+
+
+def log(string):
+    sys.stderr.write(datetime.datetime.now().strftime("%H:%M:%S.%f") + " " + string + "\n")
+
+MSG_SIZE = 1500
+TIMEOUT = 0.6
+ADV_WND = 10
+OUT_ORDER_PACKETS = {}
+RECEIVED_SEQS = []
+ACK = 0
+
+# bind to localhost and an ephemeral port
+UDP_IP = "127.0.0.1"
+UDP_PORT = 0
+
+# set up the socket
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind((UDP_IP, UDP_PORT))
+sock.settimeout(TIMEOUT)
+
+# get port we bound to
+UDP_PORT = sock.getsockname()[1]
+log("[bound] " + str(UDP_PORT))
+
+# sys out of order data
+def write():
+    global ACK, OUT_ORDER_PACKETS
+    out_of_order_packets = OUT_ORDER_PACKETS.copy()
+    while ACK in out_of_order_packets.keys():
+        packet = out_of_order_packets[ACK]
+        sys.stdout.write(packet['data'])
+        del OUT_ORDER_PACKETS[ACK]
+        ACK = packet['sequence'] + len(packet['data'])
+
+# now listen for packets
+while True:
+    try:
+        result = sock.recvfrom(MSG_SIZE)
+        # If nothing is ready, we hit the timeout
+        if result:
+            (data, addr) = result
+            try:
+                decoded = json.loads(data)
+
+                # If the EOF flag is set, exit
+                if (decoded['eof']):
+                    log("[completed]")
+                    sys.exit(0)
+
+                # If there is data, we accept it and print it out
+                if (decoded['data']):
+                    # if it is duplicated packet received, ack it
+                    if decoded['sequence'] in RECEIVED_SEQS:
+                        TIMEOUT = TIMEOUT + 0.5
+                        log("[recv data] " + str(decoded['sequence']) + " (" + str(len(decoded['data'])) + ") IGNORED")
+                        msg = json.dumps({"ack": ACK, "sequence": decoded['sequence']})
+                        log("ABOUT TO SEND " + msg)
+                        if sock.sendto(msg, addr) < len(msg):
+                            log("[error] unable to fully send packet")
+                    # if it is in order, ack it
+                    elif ACK == decoded['sequence']:
+                        RECEIVED_SEQS.append(decoded['sequence'])
+                        log("[recv data] " + str(decoded['sequence']) + " (" + str(
+                            len(decoded['data'])) + ") ACCEPTED (in-order)")
+
+                        ACK = decoded['sequence'] + len(decoded['data'])
+                        msg = json.dumps({"ack": ACK, "sequence": decoded['sequence']})
+                        log("ABOUT TO SEND " + msg)
+                        if sock.sendto(msg, addr) < len(msg):
+                            log("[error] unable to fully send packet")
+                        sys.stdout.write(decoded['data'])
+                        write()
+                    else:
+                        # if it is out of order, ack it, and put it in out_order_packets
+                        log("[recv data] " + str(decoded['sequence']) + " (" + str(
+                            len(decoded['data'])) + ") ACCEPTED (out-of-order)")
+                        RECEIVED_SEQS.append(decoded['sequence'])
+                        OUT_ORDER_PACKETS[decoded['sequence']] = decoded
+                        msg = json.dumps({"ack": decoded['sequence'] + len(decoded['data']),
+                                       "sequence": decoded['sequence']})
+                        log("ABOUT TO SEND " + msg)
+                        if sock.sendto(msg, addr) < len(msg):
+                            log("[error] unable to fully send packet")
+                        write()
+
+            except (ValueError, KeyError, TypeError) as e:
+                log("[recv corrupt packet]")
+                raise e
+        else:
+            log("[error] timeout")
+            sys.exit(-1)
+    except socket.timeout:
+        continue
